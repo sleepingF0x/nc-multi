@@ -6,10 +6,18 @@ from __future__ import annotations
 import argparse
 import collections
 import dataclasses
+from contextlib import closing
+import ipaddress
+import json
 import os
+from pathlib import Path
 import selectors
+import secrets
+import shlex
 import signal
 import socket
+import sqlite3
+import stat
 import sys
 import termios
 import time
@@ -22,12 +30,21 @@ SEND_LIMIT = 65536
 LINE_LIMIT = 8192
 CONTROL_LIMIT = 65536
 DEFAULT_IDLE_TIMEOUT = 900
+JOB_LIMIT = 20
+PENDING_JOB_STATES = {"queued", "sent", "running"}
 PROMPT = b"nc-multi> "
 HELP = """Commands:
   sessions / ls          List sessions, including retained disconnected sessions
   interact ID / use ID   Attach with local echo and line editing (plain Bash/TCP)
   interact ID raw        Attach without local echo (for a remote PTY)
   close ID               Close the connection and discard its saved output
+  name ID|IP NAME         Save a shared name for this IPv4 address
+  unname ID|IP            Remove the saved name for this IPv4 address
+  note ID|IP TEXT         Save a separate remark for this IPv4 address
+  unnote ID|IP            Remove the remark, keeping the name
+  names [ID|IP]           Show saved names and remarks, including offline hosts
+  batch PATH             Run a local Bash script on currently connected sessions
+  jobs [ID]              Show batch delivery states and remote exit codes
   help                   Show this help
   quit / exit            Stop the listener and close every connection
 
@@ -76,6 +93,53 @@ class Buffer:
 
 
 @dataclasses.dataclass
+class BatchResult:
+    job_id: int
+    session_id: int
+    peer: str
+    marker: bytes
+    state: str = "queued"
+    exit_code: int = None
+    pending: bytes = b""
+
+    def feed(self, data: bytes) -> bytes:
+        """Remove only this run's control frames, retaining split frame prefixes."""
+        data = self.pending + data
+        self.pending = b""
+        output = bytearray()
+        while data:
+            position = data.find(self.marker)
+            if position < 0:
+                keep = next((n for n in range(min(len(data), len(self.marker) - 1), 0, -1)
+                             if data.endswith(self.marker[:n])), 0)
+                output.extend(data[:-keep] if keep else data)
+                self.pending = data[-keep:] if keep else b""
+                break
+            output.extend(data[:position])
+            data = data[position:]
+            end = data.find(b"\x1f", len(self.marker))
+            if end < 0 and len(data) <= len(self.marker) + 16:
+                self.pending = data
+                break
+            body = data[len(self.marker):end] if end >= 0 else b""
+            if body == b"start":
+                self.state = "running"
+            elif (self.state == "running" and body.startswith(b"end:") and
+                  1 <= len(body[4:]) <= 3 and body[4:].isdigit() and int(body[4:]) <= 255):
+                self.exit_code = int(body[4:])
+                self.state = "ok" if self.exit_code == 0 else "failed"
+                output.extend(data[end + 1:])
+                break
+            else:
+                # An invalid frame is ordinary output. Never retain an unbounded tail.
+                output.extend(data[:1])
+                data = data[1:]
+                continue
+            data = data[end + 1:]
+        return bytes(output)
+
+
+@dataclasses.dataclass
 class Session:
     id: int
     sock: socket.socket
@@ -86,6 +150,124 @@ class Session:
     connected: bool = True
     close_reason: str = ""
     outgoing: bytearray = dataclasses.field(default_factory=bytearray)
+    batch: BatchResult = None
+
+    @property
+    def ip(self) -> str:
+        return self.peer.rsplit(":", 1)[0]
+
+
+class IPNames:
+    """Persistent per-IP labels, updated transactionally in SQLite."""
+
+    def __init__(self, path=None):
+        self.path = path
+        self.records = {}
+        self.error = ""
+        self.retry_initialization = False
+        if path is not None:
+            try:
+                path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                try:
+                    fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+                except FileExistsError:
+                    pass
+                else:
+                    os.close(fd)
+                with closing(self._connect()) as db, db:
+                    db.execute("BEGIN IMMEDIATE")
+                    db.execute("CREATE TABLE IF NOT EXISTS hosts "
+                               "(ip TEXT PRIMARY KEY, name TEXT NOT NULL DEFAULT '', "
+                               "note TEXT NOT NULL DEFAULT '')")
+                    db.execute("CREATE TABLE IF NOT EXISTS metadata "
+                               "(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+                    if not db.execute("SELECT 1 FROM metadata WHERE key = 'names_json_imported'").fetchone():
+                        legacy = path.with_name("names.json")
+                        try:
+                            values = json.loads(legacy.read_text(encoding="utf-8"))
+                        except FileNotFoundError:
+                            values = {}
+                        if not isinstance(values, dict):
+                            raise ValueError("names.json must map IPv4 addresses to names")
+                        for ip, name in values.items():
+                            self.validate(ip, name, "name")
+                            db.execute("INSERT INTO hosts (ip, name) VALUES (?, ?) "
+                                       "ON CONFLICT(ip) DO NOTHING", (ip, name))
+                        db.execute("INSERT INTO metadata VALUES ('names_json_imported', '1')")
+                    records = self._read(db)
+                self.records = records
+            except (OSError, ValueError, sqlite3.Error) as error:
+                self.retry_initialization = isinstance(error, sqlite3.OperationalError) and str(error).startswith(
+                    ("database is locked", "database table is locked", "database schema is locked"))
+                action = "Retry a name/note/names command shortly." if self.retry_initialization else "Fix the file and restart."
+                self.error = f"Cannot load names database {path}: {error}. {action}"
+
+    def _connect(self):
+        # Creation goes through __init__ with mode 0600, never a later read/write.
+        return sqlite3.connect(self.path.absolute().as_uri() + "?mode=rw", uri=True, timeout=0)
+
+    def _ensure_ready(self) -> None:
+        if self.retry_initialization:
+            recovered = IPNames(self.path)
+            self.records = recovered.records
+            self.error = recovered.error
+            self.retry_initialization = recovered.retry_initialization
+        if self.error:
+            raise ValueError(self.error)
+
+    @property
+    def values(self) -> dict:
+        return {ip: row[0] for ip, row in self.records.items() if row[0]}
+
+    @staticmethod
+    def validate(ip: str, value: str, field: str, allow_empty=False) -> None:
+        try:
+            ipaddress.IPv4Address(ip)
+        except ipaddress.AddressValueError:
+            raise ValueError("expected a valid IPv4 address") from None
+        limit = 64 if field == "name" else 512
+        if allow_empty and value == "":
+            return
+        if not isinstance(value, str) or not 1 <= len(value) <= limit or not value.strip() or not value.isprintable():
+            raise ValueError(f"{field} must contain 1-{limit} printable characters")
+
+    def _read(self, db) -> dict:
+        records = {}
+        for ip, name, note in db.execute("SELECT ip, name, note FROM hosts ORDER BY ip"):
+            self.validate(ip, name, "name", allow_empty=True)
+            self.validate(ip, note, "note", allow_empty=True)
+            records[ip] = (name, note)
+        return records
+
+    def refresh(self) -> None:
+        self._ensure_ready()
+        if self.path is not None:
+            with closing(self._connect()) as db:
+                self.records = self._read(db)
+
+    def set(self, ip: str, value=None, field="name") -> None:
+        self._ensure_ready()
+        if field not in ("name", "note"):
+            raise ValueError("unknown field")
+        self.validate(ip, value if value is not None else "", field, allow_empty=value is None)
+        value = value or ""
+        if self.path is None:
+            row = list(self.records.get(ip, ("", "")))
+            row[0 if field == "name" else 1] = value
+            if any(row):
+                self.records[ip] = tuple(row)
+            else:
+                self.records.pop(ip, None)
+            return
+        # Each statement changes only the selected field, preserving other writers.
+        sql = {"name": "INSERT INTO hosts (ip, name) VALUES (?, ?) ON CONFLICT(ip) DO UPDATE SET name=excluded.name",
+               "note": "INSERT INTO hosts (ip, note) VALUES (?, ?) ON CONFLICT(ip) DO UPDATE SET note=excluded.note"}[field]
+        with closing(self._connect()) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(sql, (ip, value))
+            db.execute("DELETE FROM hosts WHERE ip=? AND name='' AND note=''", (ip,))
+            records = self._read(db)
+        self.records = records
 
 
 class Terminal:
@@ -125,12 +307,13 @@ class Terminal:
 
 class Console:
     def __init__(self, listener: socket.socket, terminal: Terminal, buffer_limit: int,
-                 max_sessions: int, idle_timeout: int = DEFAULT_IDLE_TIMEOUT):
+                 max_sessions: int, idle_timeout: int = DEFAULT_IDLE_TIMEOUT, names=None):
         self.listener = listener
         self.terminal = terminal
         self.buffer_limit = buffer_limit
         self.max_sessions = max_sessions
         self.idle_timeout = idle_timeout
+        self.names = names if names is not None else IPNames()
         self.selector = selectors.DefaultSelector()
         self.sessions = {}
         self.next_id = 1
@@ -143,12 +326,18 @@ class Console:
         self.control = Buffer(CONTROL_LIMIT)
         self.output_registered = False
         self.running = True
+        self.jobs = {}
+        self.next_job_id = 1
 
     def emit(self, text: str) -> None:
         self.control.append(text.encode("utf-8"))
 
     def prompt(self) -> None:
         self.control.append(PROMPT)
+
+    def name_suffix(self, session: Session) -> str:
+        name = self.names.records.get(session.ip, ("", ""))[0]
+        return f" ({name})" if name else ""
 
     def notice(self, text: str) -> None:
         # Remote bytes are never rendered in the menu or in a different session.
@@ -165,6 +354,8 @@ class Console:
         self.emit(f"Listening on {host}:{port}\nType help for commands. Ctrl+] detaches a session.\n")
         timeout_label = f"{self.idle_timeout}s without submitted input" if self.idle_timeout else "disabled"
         self.emit(f"Idle timeout: {timeout_label}.\n")
+        if self.names.error:
+            self.emit(f"[!] {self.names.error}\n")
         self.prompt()
         try:
             while self.running:
@@ -213,7 +404,7 @@ class Console:
             self.next_id += 1
             self.sessions[session.id] = session
             self.selector.register(sock, selectors.EVENT_READ, session)
-            self.notice(f"[+] Session {session.id} connected from {session.peer}")
+            self.notice(f"[+] Session {session.id} connected from {session.peer}{self.name_suffix(session)}")
 
     def read_session(self, session: Session) -> None:
         try:
@@ -224,6 +415,12 @@ class Console:
             self.disconnect(session)
             return
         if data:
+            if session.batch is not None:
+                result = session.batch
+                data = result.feed(data)
+                if result.state not in PENDING_JOB_STATES:
+                    session.batch = None
+                    self.notice(f"[Job {result.job_id}] Session {session.id}: {result.state}, exit {result.exit_code}.")
             session.output.append(data)
         else:
             self.disconnect(session)
@@ -236,6 +433,11 @@ class Console:
         session.connected = False
         session.close_reason = reason
         session.outgoing.clear()
+        if session.batch is not None:
+            session.batch.state = reason
+            session.output.append(session.batch.pending)
+            session.batch.pending = b""
+            session.batch = None
         if notify:
             self.notice(f"[-] Session {session.id} disconnected; saved output is available via interact {session.id}.")
 
@@ -259,6 +461,9 @@ class Console:
     def send(self, data: bytes) -> bool:
         session = self.sessions[self.active]
         if not session.connected:
+            return False
+        if session.batch is not None:
+            self.emit("\n[Batch in progress; input was not queued. Use Ctrl+] then jobs to check progress.]\n")
             return False
         if len(session.outgoing) + len(data) > SEND_LIMIT:
             self.input_paused = True
@@ -284,6 +489,8 @@ class Console:
             return
         del session.outgoing[:sent]
         if not session.outgoing:
+            if session.batch is not None and session.batch.state == "queued":
+                session.batch.state = "sent"
             self.selector.modify(session.sock, selectors.EVENT_READ, session)
 
     def update_output_interest(self) -> None:
@@ -430,15 +637,28 @@ class Console:
         name = words[0]
         if name in ("help", "?") and len(words) == 1:
             self.emit(HELP)
+        elif name in ("name", "unname", "note", "unnote"):
+            self.name_command(line)
+        elif name == "names":
+            self.show_names(words)
+        elif name == "batch":
+            self.batch_command(line)
+        elif name == "jobs":
+            self.show_jobs(words)
         elif name in ("sessions", "ls") and len(words) == 1:
-            self.emit("ID    PEER                     STATE          BUFFERED   DROPPED    AGE       IDLE\n")
+            try:
+                self.names.refresh()
+            except (OSError, ValueError, sqlite3.Error) as error:
+                self.emit(f"[!] Cannot refresh names: {error}\n")
+            self.emit("ID    PEER                     STATE          BUFFERED   DROPPED    AGE       IDLE       NAME\n")
             now = time.monotonic()
             for session in self.sessions.values():
                 state = "connected" if session.connected else session.close_reason
                 age = int(now - session.created)
                 idle = f"{int(now - session.last_input)}s" if session.connected else "-"
                 self.emit(f"{session.id:<5} {session.peer:<24} {state:<14} "
-                          f"{session.output.size:<10} {session.output.dropped:<10} {str(age) + 's':<9} {idle}\n")
+                          f"{session.output.size:<10} {session.output.dropped:<10} {str(age) + 's':<9} "
+                          f"{idle:<10} {self.names.records.get(session.ip, ('', ''))[0] or '-'}\n")
             if not self.sessions:
                 self.emit("(no sessions)\n")
         elif name in ("quit", "exit") and len(words) == 1:
@@ -460,7 +680,7 @@ class Console:
                     self.raw = len(words) == 3
                     self.input_paused = False
                     mode = "raw (no local echo)" if self.raw else "line (local echo)"
-                    self.emit(f"[Session {session.id} {session.peer}; {mode}; Ctrl+] detaches]\n")
+                    self.emit(f"[Session {session.id} {session.peer}{self.name_suffix(session)}; {mode}; Ctrl+] detaches]\n")
                     if session.output.dropped:
                         self.emit(f"[Buffer overflow: {session.output.dropped} oldest bytes dropped in total.]\n")
                     return
@@ -468,6 +688,129 @@ class Console:
             self.emit("Unknown command. Type help.\n")
         if self.running:
             self.prompt()
+
+    def batch_command(self, line: str) -> None:
+        try:
+            parts = shlex.split(line)
+            if len(parts) != 2:
+                raise ValueError("Usage: batch PATH (quote paths containing spaces)")
+            targets = [s for s in self.sessions.values() if s.connected]
+            if not targets:
+                raise ValueError("No connected sessions.")
+            try:
+                path = Path(parts[1]).expanduser()
+            except RuntimeError as error:
+                raise ValueError("cannot expand the script path; check the user or use an absolute path") from error
+            fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+            with os.fdopen(fd, "rb") as file:
+                if not stat.S_ISREG(os.fstat(file.fileno()).st_mode):
+                    raise ValueError("script must be a regular file")
+                source = file.read(SEND_LIMIT + 1)
+            if len(source) > SEND_LIMIT:
+                raise ValueError("script exceeds the 64 KiB send limit")
+            script = source.decode("utf-8-sig").replace("\r\n", "\n")
+            if not script.strip() or "\x00" in script:
+                raise ValueError("script must be nonempty UTF-8 text without NUL bytes")
+            packets = []
+            for session in targets:
+                token = "NCMB_" + secrets.token_hex(16)
+                start = "\\036" + token + ":start\\037"
+                end = "\\036" + token + ":end:%s\\037"
+                # A child Bash contains exit/cd/redirections. Its stdin is closed to interaction.
+                command = (f"printf {shlex.quote(start)}; if bash -c {shlex.quote(script)} nc-multi-batch </dev/null; "
+                           f"then printf {shlex.quote(end)} 0; else printf {shlex.quote(end)} \"$?\"; fi\n")
+                packet = command.encode("utf-8")
+                if len(packet) > SEND_LIMIT:
+                    raise ValueError("quoted script exceeds the 64 KiB send limit; split it into smaller scripts")
+                packets.append((session, packet, b"\x1e" + token.encode("ascii") + b":"))
+            if len(self.jobs) >= JOB_LIMIT:
+                stale = next((jid for jid, (_, results) in self.jobs.items()
+                              if all(r.state not in PENDING_JOB_STATES for r in results)), None)
+                if stale is None:
+                    raise ValueError("too many unfinished jobs; wait for completion or close stalled sessions")
+                del self.jobs[stale]
+        except (OSError, ValueError) as error:
+            self.emit(f"[!] Batch not started: {error}\n")
+            return
+        job_id = self.next_job_id
+        self.next_job_id += 1
+        results = []
+        for session, packet, marker in packets:
+            result = BatchResult(job_id, session.id, session.peer, marker)
+            results.append(result)
+            if session.batch is not None or session.outgoing:
+                result.state = "skipped-busy"
+                continue
+            session.batch = result
+            session.outgoing.extend(packet)
+            session.last_input = time.monotonic()
+            self.selector.modify(session.sock, selectors.EVENT_READ | selectors.EVENT_WRITE, session)
+        self.jobs[job_id] = (str(path), results)
+        self.emit(f"[Job {job_id}] {sum(r.state == 'queued' for r in results)} queued, "
+                  f"{sum(r.state == 'skipped-busy' for r in results)} skipped. Use jobs {job_id} for results.\n")
+
+    def show_jobs(self, words) -> None:
+        if len(words) > 2 or (len(words) == 2 and
+                             (not words[1].isascii() or not words[1].isdigit() or len(words[1]) > 20)):
+            self.emit("Usage: jobs [ID]\n")
+            return
+        selected = int(words[1]) if len(words) == 2 else None
+        found = False
+        for job_id, (path, results) in self.jobs.items():
+            if selected is not None and selected != job_id:
+                continue
+            found = True
+            self.emit(f"Job {job_id}: {path!r}\nSESSION  PEER                     STATE          EXIT\n")
+            for result in results:
+                code = str(result.exit_code) if result.exit_code is not None else "-"
+                self.emit(f"{result.session_id:<9}{result.peer:<25}{result.state:<15}{code}\n")
+        if not found:
+            self.emit("(no matching jobs)\n")
+
+    def resolve_ip(self, target: str) -> str:
+        if target.isascii() and target.isdigit() and len(target) <= 20:
+            session = self.sessions.get(int(target))
+            if session is None:
+                raise ValueError("No such session. Use sessions to list IDs, or specify an IP.")
+            target = session.ip
+        IPNames.validate(target, "", "name", allow_empty=True)
+        return target
+
+    def show_names(self, words) -> None:
+        if len(words) > 2:
+            self.emit("Usage: names [ID|IP]\n")
+            return
+        try:
+            target = self.resolve_ip(words[1]) if len(words) == 2 else None
+            self.names.refresh()
+            rows = [(ip, row) for ip, row in sorted(self.names.records.items()) if target is None or ip == target]
+        except (OSError, ValueError, sqlite3.Error) as error:
+            self.emit(f"[!] Cannot read names: {error}\n")
+            return
+        self.emit("IP                NAME\n")
+        for ip, (name, note) in rows:
+            self.emit(f"{ip:<17} {name or '-'}\n  Note: {note or '-'}\n")
+        if not rows:
+            self.emit("(no saved names or notes)\n")
+
+    def name_command(self, line: str) -> None:
+        parts = line.split(maxsplit=2)
+        setting = parts[0] in ("name", "note")
+        if len(parts) != (3 if setting else 2):
+            self.emit("Usage: name ID|IP NAME | note ID|IP TEXT | unname ID|IP | unnote ID|IP\n")
+            return
+        field = "note" if parts[0] in ("note", "unnote") else "name"
+        value = parts[2].strip() if setting else None
+        try:
+            target = self.resolve_ip(parts[1])
+            self.names.set(target, value, field)
+        except (OSError, ValueError, sqlite3.Error) as error:
+            self.emit(f"[!] {field.title()} unchanged: {error}\n")
+            return
+        if value is None:
+            self.emit(f"{field.title()} removed for {target}.\n")
+        else:
+            self.emit(f"{field.title()} saved for {target}: {value}\n")
 
 
 def positive(value: str) -> int:
@@ -497,13 +840,16 @@ def main() -> int:
         parser.error("port must be between 0 and 65535")
     handlers = {}
     try:
+        config_home = os.environ.get("XDG_CONFIG_HOME")
+        config_root = Path(config_home) if config_home and Path(config_home).is_absolute() else Path.home() / ".config"
+        names = IPNames(config_root / "nc-multi" / "names.db")
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
             listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             listener.bind((args.host, args.listen))
             listener.listen(128)
             listener.setblocking(False)
             with Terminal() as terminal:
-                console = Console(listener, terminal, args.buffer_kib * 1024, args.max_sessions, args.idle_timeout)
+                console = Console(listener, terminal, args.buffer_kib * 1024, args.max_sessions, args.idle_timeout, names)
 
                 def stop(_signum, _frame):
                     console.running = False

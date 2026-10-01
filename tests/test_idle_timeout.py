@@ -21,6 +21,7 @@ class IdleDeadlineTests(unittest.TestCase):
         # No terminal is accessed by these clock-controlled network checks.
         self.console = Console(self.listener, None, 1024, 10)
         self.client = socket.create_connection(self.listener.getsockname(), timeout=2)
+        self.assertTrue(select.select([self.listener], [], [], 2)[0])
         self.console.accept()
         self.session = self.console.sessions[1]
         self.origin = self.session.last_input
@@ -90,6 +91,19 @@ class IdleIntegrationTests(unittest.TestCase):
         self.addCleanup(console.close)
         return console
 
+    def test_listener_without_clients_survives_multiple_idle_periods(self):
+        console = self.start("-t", "1")
+        # Leave the real event loop idle past more than one session deadline.
+        time.sleep(2.3)
+        self.assertIsNone(console.process.poll(), "listener exited with no clients")
+        client = console.connect()
+        console.read_until(b"Session 1 connected")
+        console.attach(1)
+        console.type(b"still-listening\r")
+        self.assertEqual(receive(client, 16), b"still-listening\n")
+        client.sendall(b"CLIENT-REPLY")
+        console.read_until(b"CLIENT-REPLY")
+
     def test_unused_session_expires_and_listener_accepts_another(self):
         console = self.start("--idle-timeout", "1")
         self.assertIn(b"Idle timeout: 1s", console.output)
@@ -99,11 +113,16 @@ class IdleIntegrationTests(unittest.TestCase):
         console.read_until(b"Session 1 idle timeout")
         console.command("sessions")
         console.read_until(b"idle-timeout")
+        # Expiring the final client must not start a listener-wide idle timer.
+        time.sleep(2.3)
+        self.assertIsNone(console.process.poll(), "listener exited after the final session expired")
         second = console.connect()
         console.read_until(b"Session 2 connected")
         second.sendall(b"AFTER-TIMEOUT")
         console.command("interact 2")
         console.read_until(b"AFTER-TIMEOUT")
+        console.type(b"still-listening\r")
+        self.assertEqual(receive(second, 16), b"still-listening\n")
         self.assertIsNone(console.process.poll())
 
     def test_active_session_expires_with_unsent_line_and_returns_to_menu(self):

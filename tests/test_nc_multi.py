@@ -12,6 +12,7 @@ import socket
 import subprocess
 import sys
 import termios
+import tempfile
 import threading
 import time
 import unittest
@@ -21,13 +22,16 @@ SCRIPT = pathlib.Path(__file__).resolve().parents[1] / "nc_multi.py"
 
 
 class RunningConsole:
-    def __init__(self, *arguments):
+    def __init__(self, *arguments, config_home=None):
+        self.config_directory = tempfile.TemporaryDirectory(prefix="nc-multi-test-")
+        self.config_home = pathlib.Path(config_home or self.config_directory.name)
         self.master, self.slave = pty.openpty()
         self.attributes = termios.tcgetattr(self.slave)
         self.flags = fcntl.fcntl(self.slave, fcntl.F_GETFL)
         self.process = subprocess.Popen(
             [sys.executable, str(SCRIPT), "--host", "127.0.0.1", "-l", "0", *arguments],
             stdin=self.slave, stdout=self.slave, stderr=self.slave, close_fds=True,
+            env={**os.environ, "XDG_CONFIG_HOME": str(self.config_home)},
         )
         self.output = bytearray()
         self.clients = []
@@ -98,6 +102,7 @@ class RunningConsole:
             client.close()
         os.close(self.master)
         os.close(self.slave)
+        self.config_directory.cleanup()
 
 
 def receive(client, count):
