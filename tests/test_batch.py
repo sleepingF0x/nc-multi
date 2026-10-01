@@ -1,7 +1,9 @@
 """Batch execution through real Bash/TCP peers and split completion frames."""
 
+import base64
 import os
 from pathlib import Path
+import re
 import select
 import shlex
 import shutil
@@ -9,8 +11,51 @@ import subprocess
 import tempfile
 import unittest
 
-from nc_multi import BatchResult, SEND_LIMIT
+from nc_multi import BATCH_DECODER, BatchResult, SEND_LIMIT
 from test_nc_multi import RunningConsole
+
+
+BASH = shutil.which("bash")
+
+
+@unittest.skipUnless(BASH, "Bash not installed")
+class BatchDecoderTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory(prefix="batch-decode-")
+        self.addCleanup(directory.cleanup)
+        self.directory = Path(directory.name)
+        self.capture = self.directory / "decoded"
+        # Observe the exact argument passed to the final Bash, without executing test bytes.
+        executable = self.directory / "bash"
+        executable.write_text(
+            f"#!{BASH}\n"
+            '[[ $# == 3 && $1 == -c && $3 == nc-multi-batch ]] || exit 81\n'
+            'printf "%s" "$2" > "$CAPTURE_PATH"\nexit 7\n'
+        )
+        executable.chmod(0o700)
+
+    def decode(self, encoded):
+        return subprocess.run(
+            [BASH, "-c", BATCH_DECODER, "nc-multi-decode", encoded],
+            env={**os.environ, "PATH": str(self.directory), "CAPTURE_PATH": str(self.capture)},
+            capture_output=True, timeout=5,
+        )
+
+    def test_all_padding_lengths_preserve_utf8_controls_and_trailing_newlines(self):
+        source = bytes(range(1, 128)) + "中文🙂 'quoted' $() `ticks` \\\n\n".encode()
+        for tail in (b"", b"\n", b"\n\n"):
+            with self.subTest(padding=len(source + tail) % 3):
+                result = self.decode(base64.b64encode(source + tail).decode())
+                self.assertEqual(result.returncode, 7, result.stderr)
+                self.assertEqual(self.capture.read_bytes(), source + tail)
+
+    def test_invalid_encoding_and_nul_never_reach_execution(self):
+        for encoded in ("", "A", "AAA", "A===", "====", "AA==junk", "AA A", "AA\nA", "!!!!", "AA=="):
+            with self.subTest(encoded=encoded):
+                result = self.decode(encoded)
+                self.assertEqual(result.returncode, 125, result.stderr)
+                self.assertIn(b"Invalid Base64 script", result.stderr)
+                self.assertFalse(self.capture.exists())
 
 
 class BatchFrameTests(unittest.TestCase):
@@ -102,6 +147,54 @@ class BatchIntegrationTests(unittest.TestCase):
         self.console.command("i 1")
         self.console.read_until(b"a'b")
 
+    def test_base64_packet_is_one_ascii_line_and_executes_without_external_decoder(self):
+        client = self.console.connect()
+        self.console.read_until(b"Session 1 connected")
+        source = (
+            "if read -r input; then exit 19; fi\n"
+            "IFS= read -r -d '' text <<'END'\n"
+            "TRANSPORT_ONLY 中文 'quotes' \"double\" $() `literal`\n"
+            "END\n"
+            "printf '%s' \"$text\"\n"
+            "printf '%s\\n' \"$data:$payload:$script:$LC_ALL\"\n"
+            "exit 7\n\n"
+        )
+        path = self.directory / "encoded.sh"
+        path.write_bytes(b"\xef\xbb\xbf" + source.replace("\n", "\r\n").encode())
+        self.run_batch(path)
+        packet = bytearray()
+        while not packet.endswith(b"\n"):
+            chunk = client.recv(65536)
+            self.assertTrue(chunk)
+            packet.extend(chunk)
+        self.assertTrue(packet.isascii())
+        self.assertEqual(packet.count(b"\n"), 1)
+        self.assertIn(base64.b64encode(source.encode()), packet)
+        self.assertNotIn(b"TRANSPORT_ONLY", packet)
+        executable_dir = self.directory / "bin"
+        executable_dir.mkdir()
+        (executable_dir / "bash").symlink_to(BASH)
+        result = subprocess.run(
+            [BASH], input=bytes(packet), cwd=self.directory,
+            env={**os.environ, "PATH": str(executable_dir), "data": "one", "payload": "two", "script": "three", "LC_ALL": "POSIX"},
+            capture_output=True, timeout=5,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, b"")
+        self.assertIn("TRANSPORT_ONLY 中文 'quotes' \"double\" $() `literal`\n".encode(), result.stdout)
+        self.assertIn(b"one:two:three:POSIX\n", result.stdout)
+        client.sendall(result.stdout)
+        self.console.read_until(b"Session 1: failed, exit 7.")
+
+    def test_quote_heavy_script_fits_after_base64_encoding(self):
+        self.bash_client()
+        self.console.read_until(b"Session 1 connected")
+        path = self.script("#" + "'" * 20000 + "\nprintf 'QUOTE-HEAVY-OK\\n'\n")
+        self.run_batch(path)
+        self.console.read_until(b"Session 1: ok, exit 0.")
+        self.console.command("i 1")
+        self.console.read_until(b"QUOTE-HEAVY-OK")
+
     def test_unresponsive_peer_does_not_block_others_and_new_peers_are_excluded(self):
         slow = self.console.connect()
         self.bash_client()
@@ -139,6 +232,37 @@ class BatchIntegrationTests(unittest.TestCase):
         self.assertIn(b"0 queued, 1 skipped", output)
         self.assertFalse(select.select([client], [], [], 0.1)[0])
 
+    def test_close_all_marks_unfinished_jobs_disconnected(self):
+        clients = [self.console.connect() for _ in range(2)]
+        self.console.read_until(b"Session 2 connected")
+        self.run_batch(self.script("echo placeholder"))
+        tokens = []
+        for client in clients:
+            packet = bytearray()
+            while not packet.endswith(b"\n"):
+                data = client.recv(65536)
+                self.assertTrue(data, "connection closed before the batch was sent")
+                packet.extend(data)
+            tokens.append(re.search(rb"NCMB_[0-9a-f]{32}", packet)[0])
+        clients[0].sendall(b"\x1e" + tokens[0] + b":start\x1fRUNNING-OUTPUT")
+        self.console.command("i 1")
+        self.console.read_until(b"RUNNING-OUTPUT")
+        self.console.detach()
+        self.console.command("jobs 1")
+        output = self.console.read_until(b"nc-multi> ")
+        self.assertRegex(output, rb"1\s+127\.0\.0\.1:\d+\s+running\s+-")
+        self.assertRegex(output, rb"2\s+127\.0\.0\.1:\d+\s+sent\s+-")
+        self.console.command("close all")
+        self.console.read_until(b"Closed all sessions (2 removed). Listener remains active.")
+        for client in clients:
+            self.assertEqual(client.recv(1), b"")
+        self.console.command("jobs 1")
+        output = self.console.read_until(b"nc-multi> ")
+        for sid in (1, 2):
+            self.assertRegex(output, str(sid).encode() + rb"\s+127\.0\.0\.1:\d+\s+disconnected\s+-")
+        self.console.command("ls")
+        self.console.read_until(b"(no sessions)")
+
     def test_idle_timeout_leaves_exit_unknown_and_listener_accepts_again(self):
         console = RunningConsole("-t", "1")
         self.addCleanup(console.close)
@@ -160,7 +284,7 @@ class BatchIntegrationTests(unittest.TestCase):
         client = self.console.connect()
         self.console.read_until(b"Session 1 connected")
         path = self.directory / "bad.sh"
-        for content in (b"", b"\xff", b"nul\x00", b"x" * (SEND_LIMIT + 1), b"'" * 20000):
+        for content in (b"", b"\xff", b"nul\x00", b"x" * (SEND_LIMIT + 1), b"x" * (SEND_LIMIT * 3 // 4)):
             with self.subTest(content=content[:10]):
                 path.write_bytes(content)
                 self.console.command("batch " + shlex.quote(str(path)))

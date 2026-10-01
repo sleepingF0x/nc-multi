@@ -258,6 +258,27 @@ class NameIntegrationTests(unittest.TestCase):
             second.command("names")
             second.read_until(b"(no saved names or notes)")
 
+    def test_close_all_preserves_names_and_notes(self):
+        console = self.start()
+        client = console.connect()
+        console.read_until(b"Session 1 connected")
+        console.command("name 1 测试机")
+        console.read_until(b"Name saved for 127.0.0.1")
+        console.command("note 1 保留备注")
+        console.read_until(b"Note saved for 127.0.0.1")
+        console.command("close all")
+        console.read_until(b"Closed all sessions (1 removed). Listener remains active.")
+        self.assertEqual(client.recv(1), b"")
+        console.command("names 127.0.0.1")
+        output = console.read_until(b"nc-multi> ")
+        self.assertIn("测试机".encode(), output)
+        self.assertIn("保留备注".encode(), output)
+        records = IPNames(console.config_home / "nc-multi" / "names.db").records
+        self.assertEqual(records["127.0.0.1"], ("测试机", "保留备注"))
+        console.connect()
+        output = console.read_until(b"Session 2 connected")
+        self.assertIn("(测试机)".encode(), output)
+
     def test_invalid_commands_and_failed_save_leave_listener_usable(self):
         console = self.start()
         console.connect()

@@ -364,11 +364,44 @@ class SessionIntegrationTests(unittest.TestCase):
         for client in clients:
             self.assertEqual(client.recv(1), b"")
 
+    def test_close_all_clears_live_and_disconnected_sessions_and_keeps_listener(self):
+        console = self.start("-m", "3")
+        first, second, third = [console.connect() for _ in range(3)]
+        console.read_until(b"Session 3 connected")
+        first.sendall(b"saved output")
+        first.close()
+        console.read_until(b"Session 1 disconnected")
+        console.command("close all")
+        console.read_until(b"Closed all sessions (3 removed). Listener remains active.")
+        for client in (second, third):
+            self.assertEqual(client.recv(1), b"")
+        console.command("ls")
+        console.read_until(b"(no sessions)")
+        console.command("i 1")
+        console.read_until(b"No such session.")
+        fresh = console.connect()
+        console.read_until(b"Session 4 connected")
+        console.attach(4)
+        console.type(b"still listening\r")
+        self.assertEqual(receive(fresh, 16), b"still listening\n")
+
+    def test_close_all_without_sessions_is_repeatable(self):
+        console = self.start()
+        for _ in range(2):
+            console.command("close all")
+            console.read_until(b"Closed all sessions (0 removed). Listener remains active.")
+        client = console.connect()
+        console.read_until(b"Session 1 connected")
+        console.attach(1)
+        console.type(b"alive\r")
+        self.assertEqual(receive(client, 6), b"alive\n")
+
     def test_invalid_commands_do_not_exit_and_close_affects_only_one_client(self):
         console = self.start()
         first, second = console.connect(), console.connect()
         console.read_until(b"Session 2 connected")
-        for invalid in ("interact", "interact -1", "interact " + "9" * 5000, "close 1 raw"):
+        for invalid in ("interact", "interact -1", "interact " + "9" * 5000,
+                        "close 1 raw", "close all raw", "close all 1", "i all"):
             console.command(invalid)
             console.read_until(b"Usage:")
             self.assertIsNone(console.process.poll())

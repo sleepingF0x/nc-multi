@@ -4,9 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import collections
 import dataclasses
+import hashlib
 from contextlib import closing
+from datetime import datetime, timezone
 import ipaddress
 import json
 import os
@@ -24,6 +27,8 @@ import time
 import tty
 import unicodedata
 
+from history_store import HistoryStore, OUTPUT_LIMIT, OUTPUT_PAGE_SIZE, PAGE_SIZE
+
 
 READ_SIZE = 65536
 SEND_LIMIT = 65536
@@ -38,6 +43,7 @@ HELP = """Commands:
   interact ID / use ID   Attach with local echo and line editing (plain Bash/TCP)
   interact ID raw        Attach without local echo (for a remote PTY)
   close ID               Close the connection and discard its saved output
+  close all              Remove all sessions and saved output; keep listening
   name ID|IP NAME         Save a shared name for this IPv4 address
   unname ID|IP            Remove the saved name for this IPv4 address
   note ID|IP TEXT         Save a separate remark for this IPv4 address
@@ -45,6 +51,8 @@ HELP = """Commands:
   names [ID|IP]           Show saved names and remarks, including offline hosts
   batch PATH             Run a local Bash script on currently connected sessions
   jobs [ID]              Show batch delivery states and remote exit codes
+  history [ID|IP] [FILE] [-p PAGE]  Query saved script runs (ID = current session)
+  result RUN [PAGE]      Show one saved run and its output (default: last page)
   help                   Show this help
   quit / exit            Stop the listener and close every connection
 
@@ -54,6 +62,41 @@ Raw mode: every byte except Ctrl+] is forwarded, including Ctrl+C and Ctrl+D.
 Session management does not create a remote PTY or recover a broken TCP stream.
 Idle timeout counts time without submitted input; remote output does not reset it.
 """
+
+# Decode with Bash 3.2+ builtins so old clients need no base64 executable.
+# printf -v preserves trailing newlines; exec starts the script with clean shell variables.
+# Keep the transport command on one line, including this fixed decoder.
+BATCH_DECODER = " ".join(line.strip() for line in r"""
+_ncb_decode() {
+local LC_ALL=C;
+local payload=$1 alphabet=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/;
+local data padding i block value a b c d octets;
+local -a pieces=();
+data=${payload%%=*};
+padding=${payload:${#data}};
+[[ $data && $data != *[!a-zA-Z0-9+/]* ]] || return 1;
+[[ $padding == '' || $padding == = || $padding == == ]] || return 1;
+((${#payload} % 4 == 0)) || return 1;
+for ((i=0; i<${#payload}; i+=4)); do
+    block=${payload:i:4};
+    a=${alphabet%%"${block:0:1}"*}; b=${alphabet%%"${block:1:1}"*};
+    c=${alphabet%%"${block:2:1}"*}; d=${alphabet%%"${block:3:1}"*};
+    value=$(((${#a} << 18) | (${#b} << 12) | ((${#c} & 63) << 6) | (${#d} & 63)));
+    printf -v octets '\\%03o\\%03o\\%03o' "$((value >> 16))" "$(((value >> 8) & 255))" "$((value & 255))" || return 1;
+    case $block in
+        *==) octets=${octets:0:4};;
+        *=) octets=${octets:0:8};;
+    esac;
+    [[ $octets != *'\000'* ]] || return 1;
+    pieces+=("$octets");
+done;
+printf -v _ncb_script '%b' "${pieces[@]}";
+};
+if _ncb_decode "$1"; then
+    [[ ! ${2:-} ]] || printf '\036%s:script\037' "$2";
+    exec bash -c "$_ncb_script" nc-multi-batch;
+else printf '[batch] Invalid Base64 script.\n' >&2; exit 125; fi
+""".strip().splitlines())
 
 
 class Buffer:
@@ -101,38 +144,53 @@ class BatchResult:
     state: str = "queued"
     exit_code: int = None
     pending: bytes = b""
+    record_id: int = None
+    received_at: float = None
+    started_at: float = None
+    finished_at: float = None
+    log: Buffer = dataclasses.field(default_factory=lambda: Buffer(OUTPUT_LIMIT))
 
     def feed(self, data: bytes) -> bytes:
         """Remove only this run's control frames, retaining split frame prefixes."""
         data = self.pending + data
         self.pending = b""
         output = bytearray()
+
+        def record(chunk):
+            output.extend(chunk)
+            if self.state == "running":
+                self.log.append(chunk)
+
         while data:
             position = data.find(self.marker)
             if position < 0:
                 keep = next((n for n in range(min(len(data), len(self.marker) - 1), 0, -1)
                              if data.endswith(self.marker[:n])), 0)
-                output.extend(data[:-keep] if keep else data)
+                record(data[:-keep] if keep else data)
                 self.pending = data[-keep:] if keep else b""
                 break
-            output.extend(data[:position])
+            record(data[:position])
             data = data[position:]
             end = data.find(b"\x1f", len(self.marker))
             if end < 0 and len(data) <= len(self.marker) + 16:
                 self.pending = data
                 break
             body = data[len(self.marker):end] if end >= 0 else b""
-            if body == b"start":
+            if body == b"start" and self.state in ("queued", "sent"):
                 self.state = "running"
+                self.received_at = time.time()
+            elif body == b"script" and self.state == "running" and self.started_at is None:
+                self.started_at = time.time()
             elif (self.state == "running" and body.startswith(b"end:") and
                   1 <= len(body[4:]) <= 3 and body[4:].isdigit() and int(body[4:]) <= 255):
                 self.exit_code = int(body[4:])
                 self.state = "ok" if self.exit_code == 0 else "failed"
+                self.finished_at = time.time()
                 output.extend(data[end + 1:])
                 break
             else:
                 # An invalid frame is ordinary output. Never retain an unbounded tail.
-                output.extend(data[:1])
+                record(data[:1])
                 data = data[1:]
                 continue
             data = data[end + 1:]
@@ -151,6 +209,7 @@ class Session:
     close_reason: str = ""
     outgoing: bytearray = dataclasses.field(default_factory=bytearray)
     batch: BatchResult = None
+    connected_at: float = dataclasses.field(default_factory=time.time)
 
     @property
     def ip(self) -> str:
@@ -307,13 +366,17 @@ class Terminal:
 
 class Console:
     def __init__(self, listener: socket.socket, terminal: Terminal, buffer_limit: int,
-                 max_sessions: int, idle_timeout: int = DEFAULT_IDLE_TIMEOUT, names=None):
+                 max_sessions: int, idle_timeout: int = DEFAULT_IDLE_TIMEOUT, names=None, history=None):
         self.listener = listener
         self.terminal = terminal
         self.buffer_limit = buffer_limit
         self.max_sessions = max_sessions
         self.idle_timeout = idle_timeout
         self.names = names if names is not None else IPNames()
+        self.history = history if history is not None else HistoryStore()
+        self.history_updates = {}
+        self.history_error = ""
+        self.history_flush_at = 0
         self.selector = selectors.DefaultSelector()
         self.sessions = {}
         self.next_id = 1
@@ -327,7 +390,6 @@ class Console:
         self.output_registered = False
         self.running = True
         self.jobs = {}
-        self.next_job_id = 1
 
     def emit(self, text: str) -> None:
         self.control.append(text.encode("utf-8"))
@@ -356,6 +418,8 @@ class Console:
         self.emit(f"Idle timeout: {timeout_label}.\n")
         if self.names.error:
             self.emit(f"[!] {self.names.error}\n")
+        if self.history.error:
+            self.emit(f"[!] History unavailable: {self.history.error}. Batch dispatch requires a writable history database.\n")
         self.prompt()
         try:
             while self.running:
@@ -378,9 +442,13 @@ class Console:
                 # Handle ready input first, then expire sessions even when other
                 # connections or the terminal are continuously generating events.
                 self.expire_idle_sessions()
+                self.flush_history()
         finally:
             for session in list(self.sessions.values()):
                 self.disconnect(session, notify=False)
+            if not self.flush_history(force=True):
+                print(f"\n[!] Some execution results could not be saved: {self.history_error}", file=sys.stderr)
+            self.history.close()
             self.selector.close()
 
     def accept(self) -> None:
@@ -418,6 +486,7 @@ class Console:
             if session.batch is not None:
                 result = session.batch
                 data = result.feed(data)
+                self.record_history(result)
                 if result.state not in PENDING_JOB_STATES:
                     session.batch = None
                     self.notice(f"[Job {result.job_id}] Session {session.id}: {result.state}, exit {result.exit_code}.")
@@ -434,9 +503,14 @@ class Console:
         session.close_reason = reason
         session.outgoing.clear()
         if session.batch is not None:
-            session.batch.state = reason
-            session.output.append(session.batch.pending)
-            session.batch.pending = b""
+            result = session.batch
+            if result.state == "running":
+                result.log.append(result.pending)
+            result.state = reason
+            result.finished_at = time.time()
+            session.output.append(result.pending)
+            result.pending = b""
+            self.record_history(result)
             session.batch = None
         if notify:
             self.notice(f"[-] Session {session.id} disconnected; saved output is available via interact {session.id}.")
@@ -491,6 +565,7 @@ class Console:
         if not session.outgoing:
             if session.batch is not None and session.batch.state == "queued":
                 session.batch.state = "sent"
+                self.record_history(session.batch)
             self.selector.modify(session.sock, selectors.EVENT_READ, session)
 
     def update_output_interest(self) -> None:
@@ -645,6 +720,10 @@ class Console:
             self.batch_command(line)
         elif name == "jobs":
             self.show_jobs(words)
+        elif name == "history":
+            self.show_history(line)
+        elif name == "result":
+            self.show_result(words)
         elif name in ("sessions", "ls") and len(words) == 1:
             try:
                 self.names.refresh()
@@ -663,10 +742,16 @@ class Console:
                 self.emit("(no sessions)\n")
         elif name in ("quit", "exit") and len(words) == 1:
             self.running = False
+        elif words == ["close", "all"]:
+            count = len(self.sessions)
+            for session in self.sessions.values():
+                self.disconnect(session, notify=False)
+            self.sessions.clear()
+            self.emit(f"Closed all sessions ({count} removed). Listener remains active.\n")
         elif name in ("interact", "use", "i", "close"):
             valid = len(words) == 2 or (len(words) == 3 and name != "close" and words[2] == "raw")
             if not valid or len(words[1]) > 20 or not words[1].isascii() or not words[1].isdigit():
-                self.emit("Usage: interact ID [raw] | close ID\n")
+                self.emit("Usage: interact ID [raw] | close ID | close all\n")
             else:
                 session = self.sessions.get(int(words[1]))
                 if session is None:
@@ -698,7 +783,7 @@ class Console:
             if not targets:
                 raise ValueError("No connected sessions.")
             try:
-                path = Path(parts[1]).expanduser()
+                path = Path(parts[1]).expanduser().absolute()
             except RuntimeError as error:
                 raise ValueError("cannot expand the script path; check the user or use an absolute path") from error
             fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
@@ -711,35 +796,44 @@ class Console:
             script = source.decode("utf-8-sig").replace("\r\n", "\n")
             if not script.strip() or "\x00" in script:
                 raise ValueError("script must be nonempty UTF-8 text without NUL bytes")
+            encoded = base64.b64encode(script.encode("utf-8")).decode("ascii")
             packets = []
             for session in targets:
                 token = "NCMB_" + secrets.token_hex(16)
                 start = "\\036" + token + ":start\\037"
                 end = "\\036" + token + ":end:%s\\037"
-                # A child Bash contains exit/cd/redirections. Its stdin is closed to interaction.
-                command = (f"printf {shlex.quote(start)}; if bash -c {shlex.quote(script)} nc-multi-batch </dev/null; "
-                           f"then printf {shlex.quote(end)} 0; else printf {shlex.quote(end)} \"$?\"; fi\n")
+                # Disable transport tracing before the archived interval, without changing
+                # the interactive shell's options. The script may still enable its own tracing.
+                command = (f"( set +xv; printf {shlex.quote(start)}; if bash -c {shlex.quote(BATCH_DECODER)} "
+                           f"nc-multi-decode {shlex.quote(encoded)} {shlex.quote(token)} </dev/null; "
+                           f"then printf {shlex.quote(end)} 0; else printf {shlex.quote(end)} \"$?\"; fi )\n")
                 packet = command.encode("utf-8")
                 if len(packet) > SEND_LIMIT:
-                    raise ValueError("quoted script exceeds the 64 KiB send limit; split it into smaller scripts")
+                    raise ValueError("Base64 script and decoder exceed the 64 KiB send limit; split the script into smaller files")
                 packets.append((session, packet, b"\x1e" + token.encode("ascii") + b":"))
+            stale = None
             if len(self.jobs) >= JOB_LIMIT:
                 stale = next((jid for jid, (_, results) in self.jobs.items()
                               if all(r.state not in PENDING_JOB_STATES for r in results)), None)
                 if stale is None:
                     raise ValueError("too many unfinished jobs; wait for completion or close stalled sessions")
-                del self.jobs[stale]
-        except (OSError, ValueError) as error:
+            if not self.flush_history(force=True):
+                raise ValueError(f"execution history is not writable: {self.history_error}")
+            entries = []
+            for session, packet, marker in packets:
+                result = BatchResult(0, session.id, session.peer, marker)
+                if session.batch is not None or session.outgoing:
+                    result.state = "skipped-busy"
+                entries.append((session, result))
+            job_id = self.history.create_batch(path, hashlib.sha256(script.encode("utf-8")).hexdigest(), entries)
+        except (OSError, ValueError, sqlite3.Error) as error:
             self.emit(f"[!] Batch not started: {error}\n")
             return
-        job_id = self.next_job_id
-        self.next_job_id += 1
-        results = []
-        for session, packet, marker in packets:
-            result = BatchResult(job_id, session.id, session.peer, marker)
-            results.append(result)
-            if session.batch is not None or session.outgoing:
-                result.state = "skipped-busy"
+        if stale is not None:
+            del self.jobs[stale]
+        results = [result for _, result in entries]
+        for (session, packet, marker), result in zip(packets, results):
+            if result.state == "skipped-busy":
                 continue
             session.batch = result
             session.outgoing.extend(packet)
@@ -760,12 +854,142 @@ class Console:
             if selected is not None and selected != job_id:
                 continue
             found = True
-            self.emit(f"Job {job_id}: {path!r}\nSESSION  PEER                     STATE          EXIT\n")
+            self.emit(f"Job {job_id}: {path!r}\nSESSION  PEER                     STATE          EXIT  RUN\n")
             for result in results:
                 code = str(result.exit_code) if result.exit_code is not None else "-"
-                self.emit(f"{result.session_id:<9}{result.peer:<25}{result.state:<15}{code}\n")
+                self.emit(f"{result.session_id:<9}{result.peer:<25}{result.state:<15}{code:<6}{result.record_id}\n")
         if not found:
             self.emit("(no matching jobs)\n")
+
+    def record_history(self, result: BatchResult) -> None:
+        if result.record_id is not None:
+            self.history_updates[result.record_id] = result
+
+    def flush_history(self, force=False) -> bool:
+        if not self.history_updates:
+            return True
+        now = time.monotonic()
+        pending_only = all(result.state in PENDING_JOB_STATES for result in self.history_updates.values())
+        if not force and now < self.history_flush_at and (pending_only or self.history_error):
+            return not self.history_error
+        self.history_flush_at = now + 0.25
+        try:
+            self.history.update(list(self.history_updates.values()))
+        except (OSError, ValueError, sqlite3.Error) as error:
+            message = str(error)
+            if message != self.history_error:
+                self.notice(f"[!] Execution history could not be saved: {message}. Pending results remain in memory; new batches are blocked.")
+            self.history_error = message
+            return False
+        self.history_updates.clear()
+        if self.history_error:
+            self.notice("[+] Pending execution history saved.")
+        self.history_error = ""
+        return True
+
+    @staticmethod
+    def history_time(value) -> str:
+        return datetime.fromtimestamp(value, timezone.utc).isoformat(timespec="seconds") if value is not None else "-"
+
+    def history_state(self, row) -> str:
+        if row["instance"] != self.history.instance and row["state"] in PENDING_JOB_STATES:
+            return "unknown"
+        return row["state"]
+
+    def show_history(self, line: str) -> None:
+        usage = "Usage: history [SESSION|IP] [SCRIPT] [-p PAGE]; SESSION refers to this console instance."
+        try:
+            words = shlex.split(line)[1:]
+            page = 1
+            if "-p" in words:
+                position = words.index("-p")
+                value = words[position + 1] if position + 1 < len(words) else ""
+                if not value.isascii() or not value.isdigit() or len(value) > 6 or int(value) < 1:
+                    raise ValueError(usage)
+                page = int(value)
+                del words[position:position + 2]
+            if len(words) > 2 or any(word.startswith("-") for word in words):
+                raise ValueError(usage)
+            session, ip, script = None, None, None
+            if words:
+                first = words[0]
+                if first.isascii() and first.isdigit():
+                    if len(first) > 18 or int(first) < 1:
+                        raise ValueError(usage)
+                    session = int(first)
+                    words.pop(0)
+                else:
+                    try:
+                        ip = str(ipaddress.IPv4Address(first))
+                        words.pop(0)
+                    except ipaddress.AddressValueError:
+                        pass
+            if len(words) > 1:
+                raise ValueError(usage)
+            if words:
+                script = words[0]
+            if not self.flush_history(force=True):
+                self.emit(f"[!] Showing saved records only; some newer results are unsaved: {self.history_error}\n")
+            rows, count, started = self.history.query(session, ip, script, page)
+        except (OSError, RuntimeError, ValueError, sqlite3.Error) as error:
+            self.emit(f"[!] Cannot query history: {error}\n")
+            return
+        pages = max(1, (count + PAGE_SIZE - 1) // PAGE_SIZE)
+        self.emit(f"Execution history: {count} records; page {page}/{pages}. Use result RUN for details.\n")
+        self.emit("RUN    JOB    SESSION  IP               START  STATE           EXIT  SCRIPT\n")
+        for row in rows:
+            sid = str(row["session_id"]) if row["instance"] == self.history.instance else f"old:{row['session_id']}"
+            code = str(row["exit_code"]) if row["exit_code"] is not None else "-"
+            self.emit(f"{row['id']:<7}{row['job_id']:<7}{sid:<9}{row['ip']:<17}"
+                      f"{'yes' if row['started_at'] is not None else '-':<7}{self.history_state(row):<16}"
+                      f"{code:<6}{row['script_name']!r}\n")
+        if not rows:
+            self.emit("(no matching execution records on this page)\n")
+        unconfirmed = [s.id for s in self.sessions.values() if s.connected and s.id not in started
+                       and (session is None or s.id == session) and (ip is None or s.ip == ip)]
+        if unconfirmed:
+            self.emit("Current sessions with no saved script-start confirmation for this filter: " +
+                      ", ".join(map(str, unconfirmed)) + ".\n")
+        self.emit("START confirms entry into the script; EXIT '-' is unknown. old: IDs belong to earlier/other consoles.\n")
+
+    def show_result(self, words) -> None:
+        try:
+            if (len(words) not in (2, 3) or any(not value.isascii() or not value.isdigit() or
+                    len(value) > 18 or int(value) < 1 for value in words[1:])):
+                raise ValueError("Usage: result RUN [OUTPUT_PAGE]")
+            if not self.flush_history(force=True):
+                self.emit(f"[!] Showing a saved record; newer results may be unsaved: {self.history_error}\n")
+            row = self.history.get(int(words[1]))
+            if row is None:
+                raise ValueError("No such execution record. Use history to find RUN IDs.")
+            output = bytes(row["output"])
+            decoded_output = output.decode("utf-8", errors="replace")
+            pages = max(1, (len(decoded_output) + OUTPUT_PAGE_SIZE - 1) // OUTPUT_PAGE_SIZE)
+            page = int(words[2]) if len(words) == 3 else pages
+            if page > pages:
+                raise ValueError(f"Output has {pages} pages.")
+        except (OSError, ValueError, sqlite3.Error) as error:
+            self.emit(f"[!] Cannot show result: {error}\n")
+            return
+        code = str(row["exit_code"]) if row["exit_code"] is not None else "unknown"
+        current = row["instance"] == self.history.instance
+        self.emit(f"Run {row['id']} / Job {row['job_id']} / Session {row['session_id']} "
+                  f"({'current' if current else 'earlier/other'} console)\n"
+                  f"Peer: {row['peer']}\nScript: {row['script_path']!r}\nSHA256: {row['sha256']}\n"
+                  f"Connected: {self.history_time(row['connected_at'])}\n"
+                  f"Submitted: {self.history_time(row['submitted_at'])}\n"
+                  f"Batch received: {self.history_time(row['received_at'])}\n"
+                  f"Script started: {self.history_time(row['started_at'])}\n"
+                  f"Finished/connection lost: {self.history_time(row['finished_at'])}\n"
+                  f"State: {self.history_state(row)} (last reported: {row['state']}); exit: {code}\n"
+                  f"Output: {len(output)} retained bytes, {row['dropped']} earlier bytes discarded; page {page}/{pages}.\n")
+        chunk = decoded_output[(page - 1) * OUTPUT_PAGE_SIZE:page * OUTPUT_PAGE_SIZE]
+        safe = "".join(c if c.isprintable() or c in "\n\t" else f"\\u{ord(c):04x}" for c in chunk)
+        self.emit(safe + ("\n" if safe and not safe.endswith("\n") else ""))
+        if not output:
+            self.emit("(no saved batch output)\n")
+        if row["exit_code"] is None:
+            self.emit("No final exit code was received; this does not establish whether the remote process stopped.\n")
 
     def resolve_ip(self, target: str) -> str:
         if target.isascii() and target.isdigit() and len(target) <= 20:
@@ -843,13 +1067,15 @@ def main() -> int:
         config_home = os.environ.get("XDG_CONFIG_HOME")
         config_root = Path(config_home) if config_home and Path(config_home).is_absolute() else Path.home() / ".config"
         names = IPNames(config_root / "nc-multi" / "names.db")
+        history = HistoryStore(config_root / "nc-multi" / "history.db")
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
             listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             listener.bind((args.host, args.listen))
             listener.listen(128)
             listener.setblocking(False)
             with Terminal() as terminal:
-                console = Console(listener, terminal, args.buffer_kib * 1024, args.max_sessions, args.idle_timeout, names)
+                console = Console(listener, terminal, args.buffer_kib * 1024, args.max_sessions,
+                                  args.idle_timeout, names, history)
 
                 def stop(_signum, _frame):
                     console.running = False

@@ -30,6 +30,7 @@ class IdleDeadlineTests(unittest.TestCase):
         for session in self.console.sessions.values():
             self.console.disconnect(session, notify=False)
         self.console.selector.close()
+        self.console.history.close()
         self.client.close()
         self.listener.close()
 
