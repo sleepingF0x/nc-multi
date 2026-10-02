@@ -1053,14 +1053,14 @@ def nonnegative(value: str) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("-l", "--listen", type=int, default=9000, metavar="PORT", help="TCP listening port; 0 chooses a free port")
+    parser.add_argument("-p", "--port", "--listen", type=int, default=9000, metavar="PORT", help="TCP listening port; 0 chooses a free port")
     parser.add_argument("-H", "--host", default="0.0.0.0", help="IPv4 address to listen on")
     parser.add_argument("-b", "--buffer-kib", type=positive, default=1024, help="maximum unread output per session in KiB")
     parser.add_argument("-m", "--max-sessions", type=positive, default=100, help="maximum retained sessions; oldest inactive closed record is evicted first")
     parser.add_argument("-t", "--idle-timeout", type=nonnegative, default=DEFAULT_IDLE_TIMEOUT, metavar="SECONDS",
                         help="disconnect each session after this many seconds without submitted input; 0 disables")
     args = parser.parse_args()
-    if not 0 <= args.listen <= 65535:
+    if not 0 <= args.port <= 65535:
         parser.error("port must be between 0 and 65535")
     handlers = {}
     try:
@@ -1070,7 +1070,7 @@ def main() -> int:
         history = HistoryStore(config_root / "nc-multi" / "history.db")
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
             listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            listener.bind((args.host, args.listen))
+            listener.bind((args.host, args.port))
             listener.listen(128)
             listener.setblocking(False)
             with Terminal() as terminal:

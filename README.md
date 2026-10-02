@@ -11,7 +11,7 @@
 ```sh
 git clone https://github.com/sleepingF0x/nc-multi.git
 cd nc-multi
-python3 nc_multi.py
+python3 nc_multi.py -p 9000
 ```
 
 默认监听 `0.0.0.0:9000`，空闲超时为 900 秒。程序需要交互终端，标准输入、输出不能重定向到文件或管道。
@@ -111,7 +111,7 @@ nc-multi> names 192.0.2.10
 脚本文件放在运行 nc-multi 的服务端。在管理菜单执行：
 
 ```text
-nc-multi> batch /path/to/check.sh
+nc-multi> batch scripts/check.sh
 nc-multi> jobs
 nc-multi> jobs 1
 ```
@@ -146,13 +146,13 @@ nc-multi> jobs 1
 每次 `batch` 都会记录每个目标会话，包括忙碌而跳过的会话。记录保存到管理端的 SQLite 数据库 `~/.config/nc-multi/history.db`；设置了绝对路径 `XDG_CONFIG_HOME` 时使用该目录。新文件权限为 `0600`，数据库位于代码仓库之外，无需数据库服务或客户端 Python。升级时同步 `nc_multi.py` 和同目录的 `history_store.py`。
 
 ```text
-nc-multi> history download_pv3.sh
-nc-multi> history 3 download_pv3.sh
-nc-multi> history 192.0.2.10 download_pv3.sh
+nc-multi> history check.sh
+nc-multi> history 3 check.sh
+nc-multi> history 192.0.2.10 check.sh
 nc-multi> result 12
 ```
 
-- `history download_pv3.sh`：查询该脚本的执行记录，并列出当前在线但尚未收到该脚本开始标记的会话。
+- `history check.sh`：查询该脚本的执行记录，并列出当前在线但尚未收到该脚本开始标记的会话。
 - `history 3`：查询**本次程序运行期间**会话 3 的所有批量执行记录，包括已经关闭的会话。
 - `history 192.0.2.10`：按 IP 查询，可跨重连和程序重启。来自同一 IP 的不同连接仍分别记录。
 - `history`：查询全部记录，每页 20 条；`history -p 2` 查看下一页，筛选条件可与 `-p` 一起使用。
@@ -170,31 +170,19 @@ nc-multi> result 12
 
 历史记录从使用此版本执行 `batch` 开始；无法追溯旧版本已丢失的内存记录，也不会自动识别在交互会话中手动执行的脚本。
 
-### 纯 Bash 下载示例
+### 通用检查脚本
 
-`examples/download_pv3.sh` 使用 Bash 内建功能通过 HTTP 下载文件，完成后调用系统的 `chmod` 添加当前用户的执行权限，**不会运行下载的文件**。无需 curl、wget、cat 或 timeout；`chmod` 是唯一外部命令。
+`scripts/check.sh` 仅使用 Bash 内建命令，输出客户端的主机名、用户、Bash 版本和工作目录，用于检查会话和批量执行是否正常。
 
-下载脚本已在 CentOS 6.10 容器的 Bash 4.1.2 和 chmod 8.4 上验证，客户端不需要 Python。必须用 `bash` 执行，不要改用 `sh`；Bash 需支持 `/dev/tcp` 和进程替换（通常依赖可用的 `/dev/fd`）。运行 nc-multi 的管理端仍需 Python 3.9+，不能直接使用 CentOS 6 自带的 Python 2.6。
-
-将示例复制到仓库外的私有目录，在脚本开头的注释后加入 `PV_HOST='你的下载服务器地址'` 和 `PV_KEY='你的下载密钥'`，再用 `batch /私有目录/download_pv3.sh` 下发。仓库中的示例不含真实地址或密钥，缺少下载地址时会直接报错。地址和密钥需要写入这份私有脚本，或预先存在于客户端导出的环境变量中；服务端的环境变量不会随 `batch` 自动传给客户端。
-
-客户端连接并停留在 Bash 提示符后，在管理菜单中执行：
+在项目根目录启动 nc-multi，客户端连接并停留在 Bash 提示符后执行：
 
 ```text
-nc-multi> batch /私有目录/download_pv3.sh
+nc-multi> batch scripts/check.sh
 nc-multi> jobs 1
 nc-multi> i 1
 ```
 
-`jobs` 后的数字是批次 ID，`i` 后的数字是会话 ID，请按实际编号替换。`batch` 自动以 Base64 发送脚本，客户端解码后通过 `bash -c` 执行，不先将脚本上传成文件；下载得到的 `pv3` 则保存到各客户端。`ok / 0` 只表示下载和赋权完成，不表示 `pv3` 已运行。同一台机器有多个会话且输出路径相同时，后执行的下载会因文件已存在而失败。
-
-下载地址由 `PV_HOST` 指定，默认保存到客户端当前目录的 `pv3`，总超时为 300 秒（含解析、连接、响应头和正文）。需要调整时，在私有脚本开头设置 `PV_HOST`、`PV_PORT`、`PV_PATH`、`PV_OUTPUT` 或 `PV_TIMEOUT`；`PV_TIMEOUT` 为 1 到 86400 的整数秒，超过会话空闲超时时还需调整 nc-multi 的 `-t`。
-
-下载器只接受 HTTP 200、明确的正数 `Content-Length` 和未压缩的响应，不跟随重定向，不处理 `Transfer-Encoding`。正文按声明长度读取并保留 NUL 等二进制字节；缺少长度时直接报错，因为单凭连接关闭无法区分下载完成与中途断开。长度校验只检测截断，不代替哈希或签名校验；该示例使用明文 HTTP，不提供 TLS。
-
-已有文件或符号链接会被拒绝覆盖。失败或超时可能留下不完整文件，但不会给它添加执行权限；确认后手动清理，或修改 `PV_OUTPUT` 使用新文件名。退出码 `0` 表示下载和赋权完成，`124` 表示总超时，其他非零值表示失败；具体阶段和原因通过会话输出查看。
-
-兼容性验证使用本地模拟 HTTP 响应，并通过两台 CentOS 6 客户端的真实 TCP 会话测试批量执行；没有访问实际下载地址或运行真实的 `pv3`。容器验证覆盖旧版用户空间，不代表已验证实际旧内核、现场网络，或 `pv3` 本身的架构与运行库兼容性。
+`jobs` 后的数字是批次 ID，`i` 后的数字是会话 ID，请按实际编号替换。自定义脚本可放入 `scripts/` 或其他目录，通过 `batch 路径` 执行；相对路径以管理端启动时的工作目录为准。
 
 ## 启动参数
 
@@ -202,7 +190,7 @@ nc-multi> i 1
 
 | 短参数 | 长参数 | 作用 | 默认值 |
 | --- | --- | --- | --- |
-| `-l` | `--listen` | 监听端口，`0` 表示自动选择空闲端口 | `9000` |
+| `-p` | `--port` / `--listen` | 监听端口，`0` 表示自动选择空闲端口 | `9000` |
 | `-H` | `--host` | 监听的 IPv4 地址 | `0.0.0.0` |
 | `-t` | `--idle-timeout` | 无交互超时秒数，`0` 关闭自动断开 | `900` |
 | `-b` | `--buffer-kib` | 每个会话的未读输出缓存上限，单位 KiB | `1024` |
@@ -212,7 +200,13 @@ nc-multi> i 1
 修改端口并把超时设为 30 分钟：
 
 ```sh
-python3 nc_multi.py -l 9001 -t 1800
+python3 nc_multi.py -p 9001 -t 1800
+```
+
+等价的长参数写法：
+
+```sh
+python3 nc_multi.py --port 9001 --idle-timeout 1800
 ```
 
 只在本机监听，并关闭自动断开：

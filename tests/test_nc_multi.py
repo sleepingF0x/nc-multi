@@ -29,7 +29,7 @@ class RunningConsole:
         self.attributes = termios.tcgetattr(self.slave)
         self.flags = fcntl.fcntl(self.slave, fcntl.F_GETFL)
         self.process = subprocess.Popen(
-            [sys.executable, str(SCRIPT), "--host", "127.0.0.1", "-l", "0", *arguments],
+            [sys.executable, str(SCRIPT), "--host", "127.0.0.1", "-p", "0", *arguments],
             stdin=self.slave, stdout=self.slave, stderr=self.slave, close_fds=True,
             env={**os.environ, "XDG_CONFIG_HOME": str(self.config_home)},
         )
