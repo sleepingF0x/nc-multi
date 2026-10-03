@@ -57,7 +57,8 @@ HELP = """Commands:
   quit / exit            Stop the listener and close every connection
 
 While attached: Ctrl+] returns to this menu without closing the connection.
-Line mode: Enter sends a line; Backspace/Ctrl+U edit; Ctrl+C clears local input.
+Menu/line editing: Left/Right move; Home/End jump; Backspace/Delete erase; Ctrl+U clears.
+Line mode: Enter sends a line; Ctrl+C clears local input without sending a signal.
 Raw mode: every byte except Ctrl+] is forwarded, including Ctrl+C and Ctrl+D.
 Session management does not create a remote PTY or recover a broken TCP stream.
 Idle timeout counts time without submitted input; remote output does not reset it.
@@ -384,8 +385,11 @@ class Console:
         self.raw = False
         self.input_paused = False
         self.line = bytearray()
+        self.line_cursor = 0
+        self.pending_utf8 = bytearray()
         self.line_overflow = False
         self.escape_state = 0
+        self.escape_parameters = bytearray()
         self.control = Buffer(CONTROL_LIMIT)
         self.output_registered = False
         self.running = True
@@ -408,6 +412,7 @@ class Console:
             self.emit(text + "\n")
             self.prompt()
             self.control.append(bytes(self.line))
+            self.shift_cursor(-self.text_width(self.line[self.line_cursor:]))
 
     def run(self) -> None:
         self.selector.register(self.listener, selectors.EVENT_READ, "listener")
@@ -631,17 +636,44 @@ class Console:
                 self.edit_line(byte)
 
     def edit_line(self, byte: int) -> None:
+        # Echo whole UTF-8 characters: inserting cursor controls between their
+        # bytes would corrupt the display when editing in the middle of a line.
+        if self.pending_utf8:
+            if 0x80 <= byte <= 0xBF:
+                self.pending_utf8.append(byte)
+                first = self.pending_utf8[0]
+                size = 2 if first < 0xE0 else 3 if first < 0xF0 else 4
+                if len(self.pending_utf8) == size:
+                    self.insert_text(bytes(self.pending_utf8))
+                    self.pending_utf8.clear()
+                return
+            self.insert_text(bytes(self.pending_utf8))
+            self.pending_utf8.clear()
+        # Control keys must still work after an incomplete escape sequence.
+        if byte < 32 or byte == 127:
+            self.escape_state = 0
+            self.escape_parameters.clear()
         if self.escape_state:
             if self.escape_state == 1:
                 self.escape_state = 2 if byte in (ord("["), ord("O")) else 0
             elif 0x40 <= byte <= 0x7E:
+                if self.escape_state == 2:
+                    self.edit_escape(byte, bytes(self.escape_parameters))
                 self.escape_state = 0
+                self.escape_parameters.clear()
+            elif self.escape_state == 2:
+                if 0x20 <= byte <= 0x3F and len(self.escape_parameters) < 16:
+                    self.escape_parameters.append(byte)
+                else:
+                    self.escape_state = 3  # Discard oversized/invalid sequences through the final byte.
             return
         if byte == 0x1B:
             self.escape_state = 1
         elif byte in (10, 13):
             line = bytes(self.line)
+            self.move_line_cursor(len(self.line))
             self.line.clear()
+            self.line_cursor = 0
             self.control.append(b"\n")
             if self.line_overflow:
                 self.line_overflow = False
@@ -656,11 +688,15 @@ class Console:
         elif byte in (8, 127):
             self.erase_character()
         elif byte == 0x15:
-            while self.line:
-                self.erase_character()
+            self.move_line_cursor(0)
+            width = self.text_width(self.line)
+            self.line.clear()
+            self.redraw_line_tail(width)
             self.line_overflow = False
         elif byte == 0x03:
+            self.move_line_cursor(len(self.line))
             self.line.clear()
+            self.line_cursor = 0
             self.line_overflow = False
             self.control.append(b"^C\n")
             if self.active is None:
@@ -672,24 +708,80 @@ class Console:
                 self.detach()
             elif not self.line:
                 self.running = False
-        elif byte >= 32 and len(self.line) < LINE_LIMIT:
-            self.line.append(byte)
-            self.control.append(bytes((byte,)))
+        elif 0xC2 <= byte <= 0xF4:
+            self.pending_utf8.append(byte)
         elif byte >= 32:
-            self.line_overflow = True
-            self.control.append(b"\a")
+            self.insert_text(bytes((byte,)))
 
-    def erase_character(self) -> None:
-        if not self.line:
-            return
-        start = len(self.line) - 1
+    @staticmethod
+    def text_width(data: bytes) -> int:
+        return sum(0 if unicodedata.combining(c) else
+                   2 if unicodedata.east_asian_width(c) in ("W", "F") else 1
+                   for c in bytes(data).decode("utf-8", errors="replace"))
+
+    def shift_cursor(self, columns: int) -> None:
+        if columns:
+            self.control.append(f"\x1b[{abs(columns)}{'C' if columns > 0 else 'D'}".encode())
+
+    def move_line_cursor(self, position: int) -> None:
+        if position < self.line_cursor:
+            self.shift_cursor(-self.text_width(self.line[position:self.line_cursor]))
+        else:
+            self.shift_cursor(self.text_width(self.line[self.line_cursor:position]))
+        self.line_cursor = position
+
+    def character_start(self, position: int) -> int:
+        start = max(0, position - 1)
         while start and self.line[start] & 0xC0 == 0x80:
             start -= 1
-        character = bytes(self.line[start:]).decode("utf-8", errors="replace")
-        del self.line[start:]
-        width = sum(0 if unicodedata.combining(c) else
-                    2 if unicodedata.east_asian_width(c) in ("W", "F") else 1 for c in character)
-        self.control.append(b"\b \b" * width)
+        return start
+
+    def character_end(self, position: int) -> int:
+        end = min(len(self.line), position + 1)
+        while end < len(self.line) and self.line[end] & 0xC0 == 0x80:
+            end += 1
+        return end
+
+    def redraw_line_tail(self, erased_width: int = 0) -> None:
+        tail = bytes(self.line[self.line_cursor:])
+        self.control.append(tail + b" " * erased_width)
+        self.shift_cursor(-(self.text_width(tail) + erased_width))
+
+    def insert_text(self, data: bytes) -> None:
+        if len(self.line) + len(data) > LINE_LIMIT:
+            self.line_overflow = True
+            self.control.append(b"\a")
+            return
+        self.line[self.line_cursor:self.line_cursor] = data
+        self.line_cursor += len(data)
+        self.control.append(data)
+        self.redraw_line_tail()
+
+    def edit_escape(self, final: int, parameters: bytes) -> None:
+        if final in (ord("C"), ord("D")) and (not parameters or parameters.isdigit()):
+            count = min(int(parameters or b"1") or 1, LINE_LIMIT)
+            position = self.line_cursor
+            for _ in range(count):
+                position = self.character_start(position) if final == ord("D") else self.character_end(position)
+            self.move_line_cursor(position)
+        elif (final == ord("H") and parameters in (b"", b"1")) or (final == ord("~") and parameters in (b"1", b"7")):
+            self.move_line_cursor(0)
+        elif (final == ord("F") and parameters in (b"", b"1")) or (final == ord("~") and parameters in (b"4", b"8")):
+            self.move_line_cursor(len(self.line))
+        elif final == ord("~") and parameters == b"3":
+            self.erase_character(forward=True)
+
+    def erase_character(self, forward: bool = False) -> None:
+        if forward:
+            start, end = self.line_cursor, self.character_end(self.line_cursor)
+        else:
+            start, end = self.character_start(self.line_cursor), self.line_cursor
+        if start == end:
+            return
+        width = self.text_width(self.line[start:end])
+        self.move_line_cursor(start)
+        del self.line[start:end]
+        self.redraw_line_tail(width)
 
     def detach(self, reason: str = "") -> None:
         sid = self.active
@@ -697,8 +789,11 @@ class Console:
         self.raw = False
         self.input_paused = False
         self.line.clear()
+        self.line_cursor = 0
+        self.pending_utf8.clear()
         self.line_overflow = False
         self.escape_state = 0
+        self.escape_parameters.clear()
         self.emit(f"\n[Detached session {sid}; unsent local input cleared.]\n")
         if reason:
             self.emit(reason + "\n")
