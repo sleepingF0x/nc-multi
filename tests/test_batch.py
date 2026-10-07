@@ -115,8 +115,8 @@ class BatchIntegrationTests(unittest.TestCase):
         self.addCleanup(finish)
         return client, child
 
-    def run_batch(self, path):
-        self.console.command("batch " + shlex.quote(str(path)))
+    def run_batch(self, path, *arguments):
+        self.console.command(" ".join(shlex.quote(str(part)) for part in ("batch", path, *arguments)))
         return self.console.read_until(b"Use jobs ")
 
     def test_two_bash_clients_report_independent_results_and_keep_shells(self):
@@ -137,6 +137,68 @@ class BatchIntegrationTests(unittest.TestCase):
         self.assertNotIn(b"\x1eNCMB_", output)
         self.console.type(b"printf 'PARENT-STILL-ALIVE\\n'\r")
         self.console.read_until(b"PARENT-STILL-ALIVE")
+
+    def test_short_option_selects_one_session_without_sending_to_other_peers(self):
+        excluded = self.console.connect()
+        self.bash_client()
+        self.console.read_until(b"Session 2 connected")
+        output = self.run_batch(self.script("printf 'SELECTED-ONLY\\n'\n"), "-s", "2")
+        self.assertIn(b"1 queued, 0 skipped", output)
+        self.console.read_until(b"Session 2: ok, exit 0.")
+        self.assertFalse(select.select([excluded], [], [], 0.1)[0], "script reached an unselected session")
+        self.console.command("jobs 1")
+        listing = self.console.read_until(b"nc-multi> ")
+        self.assertRegex(listing, rb"\n2\s+127\.0\.0\.1:\d+\s+ok\s+0")
+        self.assertNotRegex(listing, rb"\n1\s+127\.0\.0\.1:")
+
+    def test_invalid_session_selection_rejects_the_whole_batch(self):
+        connected = self.console.connect()
+        disconnected = self.console.connect()
+        self.console.read_until(b"Session 2 connected")
+        disconnected.close()
+        self.console.read_until(b"Session 2 disconnected")
+        path = self.script("printf 'MUST-NOT-RUN\\n'\n")
+        invalid_arguments = (
+            "--sessions", '--sessions ""', "--sessions 1,", "--sessions ,1", "--sessions 1,,2",
+            "--sessions 0", "--sessions -1", "--sessions 1,abc", "--sessions 1,１",
+            "--sessions 1,1-3", "--sessions 1," + "9" * 21, "--sessions 1,999", "--sessions 1,2",
+            "--sessions 1, 2", "--sessions all", "--session 1", "--sessions 1 --sessions 1",
+            '-s ""', "-s 1,999",
+        )
+        for arguments in invalid_arguments:
+            with self.subTest(arguments=arguments):
+                self.console.command("batch " + shlex.quote(str(path)) + " " + arguments)
+                output = self.console.read_until(b"nc-multi> ")
+                self.assertIn(b"Batch not started:", output)
+                self.assertFalse(select.select([connected], [], [], 0.05)[0], "an invalid selection sent a script")
+        self.console.command("jobs")
+        self.console.read_until(b"(no matching jobs)")
+        self.console.command("history")
+        self.console.read_until(b"Execution history: 0 records;")
+        output = self.run_batch(path, "--sessions", "1")
+        self.assertIn(b"[Job 1] 1 queued, 0 skipped", output)
+
+    def test_selected_busy_session_is_skipped_without_expanding_targets(self):
+        busy = self.console.connect()
+        excluded = self.console.connect()
+        self.bash_client()
+        self.console.read_until(b"Session 3 connected")
+        path = self.script("printf 'SELECTED-FREE-PEER\\n'\n")
+        self.run_batch(path, "--sessions", "1")
+        packet = bytearray()
+        while not packet.endswith(b"\n"):
+            data = busy.recv(65536)
+            self.assertTrue(data, "connection closed before the first batch was sent")
+            packet.extend(data)
+        output = self.run_batch(path, "--sessions", "1,3")
+        self.assertIn(b"1 queued, 1 skipped", output)
+        self.console.read_until(b"Session 3: ok, exit 0.")
+        self.assertFalse(select.select([busy, excluded], [], [], 0.1)[0])
+        self.console.command("jobs 2")
+        listing = self.console.read_until(b"nc-multi> ")
+        self.assertRegex(listing, rb"\n1\s+127\.0\.0\.1:\d+\s+skipped-busy\s+-")
+        self.assertRegex(listing, rb"\n3\s+127\.0\.0\.1:\d+\s+ok\s+0")
+        self.assertNotRegex(listing, rb"\n2\s+127\.0\.0\.1:")
 
     def test_script_quotes_stdin_and_redirections_do_not_break_completion(self):
         self.bash_client()

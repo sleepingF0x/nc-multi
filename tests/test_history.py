@@ -157,6 +157,30 @@ class HistoryIntegrationTests(unittest.TestCase):
         self.assertIn(b'2 records', self.command('history'))
         self.assertIn(b'RESULT-second', self.command('result 2'))
 
+    def test_selected_sessions_run_once_and_only_their_results_are_saved(self):
+        self.bash_client('first')
+        excluded = self.console.connect()
+        self.bash_client('third')
+        self.console.read_until(b'Session 3 connected')
+        self.console.command('batch ' + shlex.quote(str(self.path)) + ' --sessions 3,1,3,01')
+        self.console.read_until(b'2 queued, 0 skipped')
+        self.console.read_until(b'Session 1: failed, exit 7.')
+        self.console.read_until(b'Session 3: ok, exit 0.')
+        self.assertFalse(select.select([excluded], [], [], .1)[0], 'script reached an unselected session')
+        listing = self.command('history "check script.sh"')
+        self.assertIn(b'2 records', listing)
+        self.assertIn(b'confirmation for this filter: 2.', listing)
+        rows = self.db().execute('SELECT * FROM script_runs ORDER BY id').fetchall()
+        self.assertEqual([(r['session_id'], r['state'], r['exit_code']) for r in rows],
+                         [(3, 'ok', 0), (1, 'failed', 7)])
+        for row, node in zip(rows, (b'third', b'first')):
+            self.assertIsNotNone(row['started_at'])
+            self.assertEqual(bytes(row['output']).count(b'RESULT-' + node), 1)
+            self.assertIn(b'RESULT-' + node, self.command('result ' + str(row['id'])))
+        jobs = self.command('jobs 1')
+        self.assertNotRegex(jobs, rb'\n2\s+127\.0\.0\.1:')
+        self.assertIn(b'0 records', self.command('history 2'))
+
     def test_traced_client_does_not_archive_transport_source_or_lose_trace_setting(self):
         self.bash_client('second', trace=True)
         self.console.read_until(b'Session 1 connected')

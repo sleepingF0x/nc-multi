@@ -49,7 +49,8 @@ HELP = """Commands:
   note ID|IP TEXT         Save a separate remark for this IPv4 address
   unnote ID|IP            Remove the remark, keeping the name
   names [ID|IP]           Show saved names and remarks, including offline hosts
-  batch PATH             Run a local Bash script on currently connected sessions
+  batch PATH [--sessions ID,...]  Run a local Bash script (default: all connected)
+                         -s is an alias for --sessions; IDs come from sessions / ls
   jobs [ID]              Show batch delivery states and remote exit codes
   history [ID|IP] [FILE] [-p PAGE]  Query saved script runs (ID = current session)
   result RUN [PAGE]      Show one saved run and its output (default: last page)
@@ -872,9 +873,21 @@ class Console:
     def batch_command(self, line: str) -> None:
         try:
             parts = shlex.split(line)
-            if len(parts) != 2:
-                raise ValueError("Usage: batch PATH (quote paths containing spaces)")
-            targets = [s for s in self.sessions.values() if s.connected]
+            if len(parts) not in (2, 4) or (len(parts) == 4 and parts[2] not in ("--sessions", "-s")):
+                raise ValueError("Usage: batch PATH [--sessions ID,... | -s ID,...] (quote paths containing spaces)")
+            if len(parts) == 4:
+                values = [value.strip() for value in parts[3].split(",")]
+                if any(not value.isascii() or not value.isdigit() or len(value) > 20 or int(value) < 1
+                       for value in values):
+                    raise ValueError("sessions must be comma-separated positive session IDs, e.g. --sessions 1,3,5")
+                ids = list(dict.fromkeys(int(value) for value in values))
+                unavailable = [sid for sid in ids if sid not in self.sessions or not self.sessions[sid].connected]
+                if unavailable:
+                    raise ValueError("sessions not found or disconnected: " + ", ".join(map(str, unavailable)) +
+                                     "; no scripts were sent. Use sessions / ls to check IDs")
+                targets = [self.sessions[sid] for sid in ids]
+            else:
+                targets = [s for s in self.sessions.values() if s.connected]
             if not targets:
                 raise ValueError("No connected sessions.")
             try:
